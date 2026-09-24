@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 """
-Script di valutazione LLM con quantizzazione bitsandbytes per tesi.
-Modelli: Qwen2.5-7B-Instruct / Qwen2.5-3B-Instruct (o Qwen3-4B)
-Formati: FP16 (baseline), INT8 (LLM.int8()), INT4 (NF4)
+LLM evaluation script with bitsandbytes quantization for thesis.
+Models: Qwen2.5-7B-Instruct / Qwen2.5-3B-Instruct (or Qwen3-4B)
+Formats: FP16 (baseline), INT8 (LLM.int8()), INT4 (NF4)
 
-Correzioni rispetto allo script originale:
-  1. Seed globale + determinismo CUDA per riproducibilità bit-identica
-  2. torch.cuda.synchronize() prima/dopo la generazione per tempi corretti
-  3. Throughput calcolato solo sui token effettivamente generati (no padding)
-  4. Batch size 1 per evitare artefatti da padding variabile
-  5. Struttura report identica all'originale per compatibilità
+Usage:
+python evaluate_qwen.py --model qwen7b --quant fp16 --output results_7b_fp16.txt
+python evaluate_qwen.py --model qwen3b --quant int8 --output results_3b_int8.txt
+python evaluate_qwen.py --model qwen7b --quant int4 --output results_7b_int4.txt
 
-Uso:
-  python evaluate_qwen.py --model qwen7b --quant fp16 --output results_7b_fp16.txt
-  python evaluate_qwen.py --model qwen3b --quant int8  --output results_3b_int8.txt
-  python evaluate_qwen.py --model qwen7b --quant int4  --output results_7b_int4.txt
-
-Nota: impostare la variabile d'ambiente PRIMA di lanciare:
-  export CUBLAS_WORKSPACE_CONFIG=:4096:8
+Note: set the environment variable BEFORE launching:
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 """
 
 import os
@@ -48,8 +41,8 @@ DATASET_NAME = "google/wmt24pp"
 CONFIG       = "en-it_IT"
 SRC_LANG     = "en"
 TGT_LANG     = "Italian"
-MAX_SAMPLES  = 300          # Stesso numero su TUTTI i test
-BATCH_SIZE   = 1            # Batch=1: elimina artefatti da padding
+MAX_SAMPLES  = 300          # Same number for ALL tests
+BATCH_SIZE   = 1            
 
 SYSTEM_PROMPT = (
     "You are a professional translator. "
@@ -58,61 +51,61 @@ SYSTEM_PROMPT = (
     "No explanations, no introduction, no conversational text."
 )
 
-# Questo pulisce la variabile a livello di runtime Python prima che parta PyTorch
+# This clears the variable at Python runtime before PyTorch starts
 if "CUBLAS_WORKSPACE_CONFIG" in os.environ:
     del os.environ["CUBLAS_WORKSPACE_CONFIG"]
 
 
-# ── Riproducibilità ────────────────────────────────────────────────────────
+# ── Reproducibility ────────────────────────────────────────────────────────
 
 def set_deterministic(seed: int = SEED):
-    """Fissa tutti i generatori e forza kernel deterministici CUDA."""
+    """Fix all random generators and force deterministic CUDA kernels"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # Kernel deterministici (richiede CUBLAS_WORKSPACE_CONFIG=:4096:8)
-    # --- MODIFICA SALVA-TESI: DISATTIVATO IL BLOCCO PER RIPRISTINARE LA VELOCITA' ---
+    # Deterministic kernels (requires CUBLAS_WORKSPACE_CONFIG=:4096:8) 
+    # --- THESIS-SAFE MODIFICATION: DISABLED THE BLOCK TO RESTORE SPEED --- 
     # torch.use_deterministic_algorithms(True, warn_only=True)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    # Verifica variabile d'ambiente
+    # Check environment variable
     cublas = os.environ.get("CUBLAS_WORKSPACE_CONFIG", "")
     if ":4096:8" not in cublas:
         print(
-            "⚠  CUBLAS_WORKSPACE_CONFIG non impostata. "
-            "Esegui:  export CUBLAS_WORKSPACE_CONFIG=:4096:8  "
-            "prima di lanciare lo script per piena riproducibilità."
+            "⚠  CUBLAS_WORKSPACE_CONFIG not set. "
+            "Run: export CUBLAS_WORKSPACE_CONFIG=:4096:8  "
+            "before launching the script for full reproducibility."
         )
 
 
-# ── Caricamento modello ────────────────────────────────────────────────────
+# ── Model Loading ────────────────────────────────────────────────────
 
 def setup_model(model_key: str, quantization_level: str):
-    """Carica tokenizer e modello con la quantizzazione richiesta."""
+    """Load tokenizer and model with the requested quantization."""
     if model_key not in MODEL_MAPPING:
         raise ValueError(
-            f"Modello '{model_key}' non supportato. "
-            f"Scegli tra: {', '.join(MODEL_MAPPING.keys())}"
+            f"model '{model_key}' not supported. "
+            f"Choose from: {', '.join(MODEL_MAPPING.keys())}"
         )
 
     model_id = MODEL_MAPPING[model_key]
     print(f"\n{'='*60}")
-    print(f"Caricamento: {model_id}  |  Precisione: {quantization_level.upper()}")
+    print(f"Loading: {model_id}  |  Precision: {quantization_level.upper()}")
     print(f"{'='*60}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     if not torch.cuda.is_available():
-        print("⚠  Nessuna GPU rilevata — esecuzione su CPU (molto lenta).")
+        print("⚠  No GPU detected — running on CPU (very slow).")
         model = AutoModelForCausalLM.from_pretrained(model_id, device_map="cpu")
         return tokenizer, model, model_id, "cpu"
 
     device = "cuda:0"
 
-    # ── Configurazione quantizzazione ──
+    # ── Quantization Configuration ──
     load_kwargs = dict(device_map={"": 0})
 
     if quantization_level == "fp16":
@@ -128,7 +121,7 @@ def setup_model(model_key: str, quantization_level: str):
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
     else:
-        raise ValueError("Livello non supportato. Usa: fp16, int8, int4.")
+        raise ValueError("Level not supported. Use: fp16, int8, int4.")
 
     model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
 
@@ -140,29 +133,29 @@ def setup_model(model_key: str, quantization_level: str):
     return tokenizer, model, model_id, device
 
 
-# ── Valutazione ────────────────────────────────────────────────────────────
+# ── Evaluation ────────────────────────────────────────────────────────────
 
 def run_evaluation(model_key: str, quantization_level: str, output_file: str):
     set_deterministic(SEED)
 
-    # Pulizia memoria GPU
+    # GPU memory cleanup
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.empty_cache()
 
     tokenizer, model, model_id, device = setup_model(model_key, quantization_level)
 
-    # ── VRAM dopo il caricamento ──
+    # ── VRAM after loading ──
     if device != "cpu":
         torch.cuda.synchronize()
     vram_model_load = (
         torch.cuda.max_memory_allocated() / (1024**3)
         if device != "cpu" else 0.0
     )
-    print(f"VRAM modello a riposo: {vram_model_load:.2f} GB")
+    print(f"Model idle VRAM: {vram_model_load:.2f} GB")
 
-    # ── Caricamento dataset ──
-    print(f"Caricamento dataset {DATASET_NAME} ({CONFIG})...")
+    # ── Loading Dataset ──
+    print(f"Loading dataset {DATASET_NAME} ({CONFIG})...")
     nltk.download("wordnet", quiet=True)
     nltk.download("punkt_tab", quiet=True)
 
@@ -175,14 +168,14 @@ def run_evaluation(model_key: str, quantization_level: str, output_file: str):
             break
         sorgenti.append(ex["source"])
         riferimenti.append(ex["target"])
-    print(f"Caricate {len(sorgenti)} coppie sorgente-riferimento.")
+    print(f"Loaded {len(sorgenti)} source-target pairs.")
 
-    # ── Inferenza ──
-    print(f"\nInizio traduzione ({len(sorgenti)} frasi, batch_size={BATCH_SIZE})...")
+    # ── Inference ──
+    print(f"\nStarting translation ({len(sorgenti)} sentences, batch_size={BATCH_SIZE})...")
     predizioni = []
-    total_generated_tokens = 0  # solo token reali, no padding
+    total_generated_tokens = 0  # only real tokens, no padding
 
-    # Sincronizza e avvia cronometro
+    # Synchronize and start timer
     if device != "cpu":
         torch.cuda.synchronize()
     start_time = time.time()
@@ -190,11 +183,11 @@ def run_evaluation(model_key: str, quantization_level: str, output_file: str):
     for i in tqdm(range(0, len(sorgenti), BATCH_SIZE)):
         batch = sorgenti[i : i + BATCH_SIZE]
 
-        # Costruisci prompt strutturato specifico per modello
+        # Build model-specific structured prompt
         prompts = []
         for s in batch:
             if "gemma" in model_key:
-                # Per Gemma: fondiamo il system prompt nel messaggio user
+                # For Gemma: embed the system prompt in the user message
                 messages = [
                     {
                         "role": "user", 
@@ -202,7 +195,7 @@ def run_evaluation(model_key: str, quantization_level: str, output_file: str):
                     },
                 ]
             else:
-                # Per Qwen: manteniamo la struttura originale
+                # For Qwen: maintain the original structure
                 messages = [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user",   "content": f"Text to translate: {s}"},
@@ -218,36 +211,33 @@ def run_evaluation(model_key: str, quantization_level: str, output_file: str):
             prompts, return_tensors="pt", padding=True
         ).to(device)
 
-        # --- INIZIO MODIFICA SALVA-TESI ---
-        # Blocca fisicamente la generazione del tag <think> costringendo Qwen a tradurre subito
         bad_words = [tokenizer.encode("<think>", add_special_tokens=False)]
-        # --- FINE MODIFICA ---
 
         with torch.no_grad():
             generated = model.generate(
                 **inputs,
                 max_new_tokens=256,
-                do_sample=False,    # greedy deterministico
+                do_sample=False,    # deterministic greedy decoding
                 num_beams=1,
-                bad_words_ids=bad_words # <-- PARAMETRO AGGIUNTO QUI
+                bad_words_ids=bad_words 
             )
 
-        # Conta solo i token nuovi (escluso prompt) e solo quelli non-pad
+        # Count only new tokens (excluding prompt) and only non-pad tokens
         prompt_len = inputs.input_ids.shape[1]
         new_tokens = generated[:, prompt_len:]
 
         for row in new_tokens:
-            # Conta token reali (diversi da pad/eos) per questa frase
+            # Count real tokens (different from pad/eos) for this sentence
             real = (row != tokenizer.pad_token_id).sum().item()
             total_generated_tokens += real
 
         decoded = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
         for d in decoded:
-            # Pulisce la stringa dai tag residui prima di salvarla
+            # Clean the string of any residual tags before saving
             testo_pulito = d.replace("</think>", "").replace("<think>", "").strip()
             predizioni.append(testo_pulito)
 
-    # Sincronizza e ferma cronometro
+    # Synchronize and stop timer
     if device != "cpu":
         torch.cuda.synchronize()
     end_time = time.time()
@@ -255,14 +245,14 @@ def run_evaluation(model_key: str, quantization_level: str, output_file: str):
     total_time = end_time - start_time
     throughput = total_generated_tokens / total_time if total_time > 0 else 0.0
 
-    # ── VRAM picco ──
+    # ── VRAM Peak ──
     vram_peak = (
         torch.cuda.max_memory_allocated() / (1024**3)
         if device != "cpu" else 0.0
     )
 
-    # ── Metriche linguistiche ──
-    print("\nCalcolo metriche linguistiche...")
+    # ── Linguistic metrics ──
+    print("\nCalculating linguistic metrics...")
     bleu_metric   = evaluate.load("sacrebleu")
     rouge_metric  = evaluate.load("rouge")
     meteor_metric = evaluate.load("meteor")
@@ -280,35 +270,35 @@ def run_evaluation(model_key: str, quantization_level: str, output_file: str):
         references=riferimenti,
     )
 
-    # ── Scrittura report ──
+    # ── Report writing ──
     with open(output_file, "w", encoding="utf-8") as f:
-        f.write(f"REPORT TESI - Modello: {model_id}\n")
-        f.write(f"Livello Quantizzazione: {quantization_level.upper()}\n")
+        f.write(f"THESIS REPORT - Model: {model_id}\n")
+        f.write(f"Quantization level: {quantization_level.upper()}\n")
         f.write(f"Seed: {SEED}\n")
-        f.write(f"Campioni: {len(sorgenti)}\n")
+        f.write(f"Samples: {len(sorgenti)}\n")
         f.write(f"Batch Size: {BATCH_SIZE}\n")
         f.write("-" * 50 + "\n")
 
-        f.write("\n=== METRICHE LINGUISTICHE ===\n")
+        f.write("\n=== LINGUISTIC METRICS ===\n")
         f.write(f"SacreBLEU:  {bleu_result['score']:.2f}\n")
         f.write(f"METEOR:     {meteor_result['meteor']:.4f}\n")
         f.write(f"ROUGE-L:    {rouge_result['rougeL']:.4f}\n")
 
-        f.write("\n=== PROFILAZIONE HARDWARE ===\n")
-        f.write(f"VRAM Modello a riposo:      {vram_model_load:.2f} GB\n")
-        f.write(f"VRAM Picco Max (Inferenza): {vram_peak:.2f} GB\n")
-        f.write(f"Tempo Totale Esecuzione:    {total_time:.2f} secondi\n")
-        f.write(f"Token Generati (reali):     {total_generated_tokens}\n")
-        f.write(f"Throughput:                 {throughput:.2f} Token/secondo\n")
+        f.write("\n=== HARDWARE PROFILING ===\n")
+        f.write(f"Idle model VRAM:      {vram_model_load:.2f} GB\n")
+        f.write(f"VRAM Peak (Inference): {vram_peak:.2f} GB\n")
+        f.write(f"Total Execution Time:    {total_time:.2f} seconds\n")
+        f.write(f"Generated Tokens (real):     {total_generated_tokens}\n")
+        f.write(f"Throughput:                 {throughput:.2f} Tokens/second\n")
 
-        f.write("\n=== CONFIGURAZIONE ===\n")
+        f.write("\n=== CONFIGURATION ===\n")
         f.write(f"GPU: {torch.cuda.get_device_name(0) if device != 'cpu' else 'CPU'}\n")
         f.write(f"CUDA: {torch.version.cuda if device != 'cpu' else 'N/A'}\n")
         f.write(f"PyTorch: {torch.__version__}\n")
         f.write(f"Decoding: greedy (do_sample=False, num_beams=1)\n")
         f.write(f"Max new tokens: 256\n")
 
-        f.write("\n=== ESEMPI DI TRADUZIONE (primi 20) ===\n")
+        f.write("\n=== TRANSLATION EXAMPLES (first 20) ===\n")
         for j, (s, p, r) in enumerate(zip(sorgenti, predizioni, riferimenti)):
             if j >= 20:
                 break
@@ -317,34 +307,34 @@ def run_evaluation(model_key: str, quantization_level: str, output_file: str):
             f.write(f"  HYP: {p}\n")
             f.write(f"  REF: {r}\n")
 
-    print(f"\n✅ Risultati salvati in: {output_file}")
+    print(f"\n✅ Results saved to: {output_file}")
     print(f"   BLEU={bleu_result['score']:.2f}  "
           f"METEOR={meteor_result['meteor']:.4f}  "
           f"ROUGE-L={rouge_result['rougeL']:.4f}")
     print(f"   VRAM={vram_peak:.2f}GB  "
           f"Throughput={throughput:.2f} tok/s  "
-          f"Tempo={total_time:.1f}s")
+          f"Time={total_time:.1f}s")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Valutazione LLM con quantizzazione bitsandbytes (tesi)"
+        description="LLM evaluation with bitsandbytes quantization (thesis)"
     )
     parser.add_argument(
         "--model", type=str, required=True,
         choices=list(MODEL_MAPPING.keys()),
-        help="Chiave modello (es. qwen7b, qwen3b)"
+        help="Key model (e.g., qwen7b, qwen3b)"
     )
     parser.add_argument(
         "--quant", type=str, required=True,
         choices=["fp16", "int8", "int4"],
-        help="Livello di precisione"
+        help="Quantization level"
     )
     parser.add_argument(
         "--output", type=str, required=True,
-        help="Percorso file di output (.txt)"
+        help="Output file path (.txt)"
     )
     args = parser.parse_args()
 
